@@ -1,7 +1,6 @@
 using .QuestDB
 using .LibQuestDB
 using Dates
-using c_questdb_client_jll
 using Test
 include("mock_server.jl")
 

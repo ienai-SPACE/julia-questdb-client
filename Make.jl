@@ -1,24 +1,44 @@
-using Pkg
-Pkg.add("ArgParse", io=devnull)
-
-using ArgParse
-
-s = ArgParseSettings()
-
-@add_arg_table s begin
-    "command"
-        required = true
-        arg_type = String
-        help = "Make command to run. E.g. build, clean, etc."
-end
+# Make.jl serves two roles:
+#   1. As a script:  `julia Make.jl build`  (CLI workflow, used during dev)
+#   2. As a library: `include("Make.jl")` from deps/build.jl  (Pkg integration)
+#
+# The CLI block is gated at the bottom so `include()` does not auto-run
+# ArgParse, which is otherwise installed via Pkg and that side-effect must
+# not happen during a package build.
 
 
 questdb_rs_ffi_dir = joinpath(@__DIR__, "c-questdb-client", "questdb-rs-ffi")
+patched_lockfile  = joinpath(@__DIR__, "patches", "questdb-rs-ffi-Cargo.lock")
+
+
+"""
+    apply_lockfile_override()
+
+Overwrite the Cargo.lock that ships with the upstream c-questdb-client
+submodule with our IENAI-curated copy under `patches/`. The upstream lockfile
+pins old transitive Rust deps (`rustls-webpki 0.103.6`, `bytes 1.10.1`,
+`rand 0.9.2`, etc.) with public CVEs. Rather than maintaining a parallel fork
+of questdb/c-questdb-client just to bump a lockfile, we keep the submodule
+pointing at upstream `6.0.0` and apply this override at build time.
+
+See README.md → "Cargo.lock override" for the long-form rationale and the
+process for refreshing the patch.
+"""
+function apply_lockfile_override()
+    isfile(patched_lockfile) || error("Patched lockfile not found: $patched_lockfile")
+    target = joinpath(questdb_rs_ffi_dir, "Cargo.lock")
+    cp(patched_lockfile, target, force = true)
+    @info "Applied Cargo.lock override" from=patched_lockfile to=target
+end
 
 
 function build()
+    apply_lockfile_override()
+    # --locked refuses to silently rewrite the lockfile if Cargo.toml has drifted
+    # away from our patched lockfile — catches the case where upstream c-questdb-client
+    # bumped a dep and our override is out of date.
     cargo_build = Cmd(
-        `cargo build --release`,
+        `cargo build --release --locked`,
         dir = questdb_rs_ffi_dir)
     run(cargo_build)
 
@@ -64,24 +84,35 @@ function sync_submodule()
 end
 
 
-function main()
-    parsed_args = parse_args(ARGS, s)
+# CLI entry point — only runs when this file is invoked directly via
+#   julia Make.jl <command>
+# When included from deps/build.jl or any other Julia code, this block is
+# skipped (no ArgParse install, no auto-run).
+if abspath(PROGRAM_FILE) == @__FILE__
+    using Pkg
+    Pkg.add("ArgParse", io=devnull)
 
+    using ArgParse
+
+    s = ArgParseSettings()
+
+    @add_arg_table s begin
+        "command"
+            required = true
+            arg_type = String
+            help = "Make command to run. E.g. build, clean, sync_submodule."
+    end
+
+    parsed_args = parse_args(ARGS, s)
     command = parsed_args["command"]
 
     if command == "build"
         build()
-
     elseif command == "clean"
         clean()
-
     elseif command == "sync_submodule"
         sync_submodule()
-
     else
         println("Unknown command: $command")
-
     end
 end
-
-main()

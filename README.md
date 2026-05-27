@@ -68,3 +68,50 @@ You can also sign up to our mailing list to get notified of new releases.
 
 # License
 The code is released under the Apache License 2.0.
+
+---
+
+# IENAI fork notes
+
+## Cargo.lock override (technical debt)
+
+The `c-questdb-client` submodule tracks upstream
+[`questdb/c-questdb-client`](https://github.com/questdb/c-questdb-client) at
+tag `6.0.0`. Upstream ships a `questdb-rs-ffi/Cargo.lock` that pins old
+transitive Rust dependencies with public CVEs (e.g. `rustls-webpki 0.103.6`,
+`bytes 1.10.1`, `rand 0.9.2`).
+
+Rather than maintaining a parallel fork of `c-questdb-client` just to bump a
+lockfile, we keep the submodule pointing at vanilla upstream and apply our
+own lockfile at build time via `Make.jl`:
+
+1. `patches/questdb-rs-ffi-Cargo.lock` is the IENAI-curated lockfile (deps
+   bumped to the most recent semver-compatible versions known to be
+   CVE-free).
+2. `Make.jl :: apply_lockfile_override()` copies that file over the
+   submodule's `Cargo.lock` immediately before `cargo build --release --locked`.
+
+### Refreshing the patch
+
+When the submodule is bumped to a new upstream tag OR when new CVEs land
+against transitive deps, regenerate the patch:
+
+```bash
+# From the repo root
+cd c-questdb-client/questdb-rs-ffi
+cargo update                      # updates Cargo.lock in place
+cp Cargo.lock ../../patches/questdb-rs-ffi-Cargo.lock
+cd ../..
+git checkout -- c-questdb-client  # discard the in-submodule edit
+```
+
+Commit the updated `patches/questdb-rs-ffi-Cargo.lock`. Renovate / Dependabot
+can be wired to do this automatically by treating that file as a regular
+`Cargo.lock`.
+
+### When this debt can be paid down
+
+This override exists because we don't currently maintain an IENAI fork of
+`c-questdb-client`. The day we either (a) take over the submodule with our
+own fork, or (b) upstream accepts a PR to refresh `Cargo.lock`, the override
+can be deleted and `Make.jl :: apply_lockfile_override()` removed.

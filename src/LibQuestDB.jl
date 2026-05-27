@@ -1,8 +1,33 @@
 module LibQuestDB
 
 using CEnum
-using c_questdb_client_jll
-export c_questdb_client_jll
+
+# Path to the libquestdb_client native library built from source by Make.jl
+# (invoked via deps/build.jl during Pkg.build / Pkg.instantiate). We bypass
+# the upstream c_questdb_client_jll because it has not been re-published
+# since 2023-02 and ships unpatched Rust transitive deps with public CVEs.
+# See README.md → "IENAI fork notes" for the long-form rationale.
+const libquestdb_client = let
+    libname = if Sys.iswindows()
+        "questdb_client.dll"
+    elseif Sys.isapple()
+        "libquestdb_client.dylib"
+    else
+        "libquestdb_client.so"
+    end
+    joinpath(@__DIR__, libname)
+end
+
+function __init__()
+    if !isfile(libquestdb_client)
+        error("""
+              libquestdb_client native library not found at $(libquestdb_client).
+              Run `Pkg.build("QuestDB")` (or `julia Make.jl build` for a manual
+              rebuild). The library is produced by compiling
+              c-questdb-client/questdb-rs-ffi via cargo and copied into src/.
+              """)
+    end
+end
 
 """
     line_sender_utf8
