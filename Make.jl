@@ -87,25 +87,13 @@ end
 # CLI entry point — only runs when this file is invoked directly via
 #   julia Make.jl <command>
 # When included from deps/build.jl or any other Julia code, this block is
-# skipped (no ArgParse install, no auto-run).
+# skipped. We deliberately avoid ArgParse here: Julia expands macros at the
+# parse time of the enclosing block, before the `using ArgParse` inside the
+# same `if` has executed, which would crash `include("Make.jl")` from
+# deps/build.jl with `UndefVarError: @add_arg_table`. Three commands do not
+# need argument-parsing machinery anyway.
 if abspath(PROGRAM_FILE) == @__FILE__
-    using Pkg
-    Pkg.add("ArgParse", io=devnull)
-
-    using ArgParse
-
-    s = ArgParseSettings()
-
-    @add_arg_table s begin
-        "command"
-            required = true
-            arg_type = String
-            help = "Make command to run. E.g. build, clean, sync_submodule."
-    end
-
-    parsed_args = parse_args(ARGS, s)
-    command = parsed_args["command"]
-
+    command = isempty(ARGS) ? "" : ARGS[1]
     if command == "build"
         build()
     elseif command == "clean"
@@ -113,6 +101,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     elseif command == "sync_submodule"
         sync_submodule()
     else
-        println("Unknown command: $command")
+        println(stderr, "Usage: julia Make.jl <build|clean|sync_submodule>")
+        exit(1)
     end
 end
