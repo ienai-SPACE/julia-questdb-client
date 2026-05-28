@@ -44,18 +44,20 @@ end
     * `port`: Port to connect to.
     * `auth`: Authentication credentials in the form of a tuple containing `(key_id, priv_key, pub_key_x, pub_key_y)`.
     * `tls` :  Whether to use TLS encryption. Defaults to `false`.
+    * `init_capacity`: Initial buffer capacity in bytes. Defaults to `64 * 1024`. Callers that
+      pre-size for large batches (e.g. simulation ingest) can raise this to avoid mid-flush realloc.
 
-    ## Methods 
+    ## Methods
 
-    * `table(name::String)`            
-    * `symbol(name::String, value::String)`            
-    * `column(name::String, column_value::Union{String, Int, Float64, Bool, Dates.TimeType})`            
-    * `at_now()`            
-    * `at(timestamp::Dates.TimeType)`            
+    * `table(name::String)`
+    * `symbol(name::String, value::String)`
+    * `column(name::String, column_value::Union{String, Int, Float64, Bool, Dates.TimeType})`
+    * `at_now()`
+    * `at(timestamp::Dates.TimeType)`
     * `flush()`
-        
 
-    ## Returns        
+
+    ## Returns
     Sender object that can be used to send data.
 """
 mutable struct Sender        
@@ -71,7 +73,7 @@ mutable struct Sender
     sender::Ref{line_sender}
     auth::Bool
     
-    function Sender(host::String="localhost", port::Int=9009; auth=nothing, tls::Bool=false)
+    function Sender(host::String="localhost", port::Int=9009; auth=nothing, tls::Bool=false, init_capacity::Int=64 * 1024)
         err = Ref{Ptr{line_sender_error}}(C_NULL)
         opts = Ref{line_sender_opts}()
         sender = Ref{line_sender}()
@@ -86,7 +88,7 @@ mutable struct Sender
         is_host_ok = line_sender_utf8_init(host_utf8, length(host), host, err)    
 
         global buffer = line_sender_buffer_new();
-        line_sender_buffer_reserve(buffer, 64 * 1024);        
+        line_sender_buffer_reserve(buffer, init_capacity);
 
         if (is_host_ok)                                    
             opts = line_sender_opts_new(host_utf8[], port[])                        
