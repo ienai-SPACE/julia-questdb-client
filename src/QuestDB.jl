@@ -78,6 +78,12 @@ mutable struct Sender
     err::Ref{Ptr{line_sender_error}}
     sender::Ptr{line_sender}
     auth::Bool
+    # c-questdb-client 6.0.0 documents line_sender_close as non-idempotent.
+    # Under concurrent ingest a double-close (error_handler + caller finally)
+    # is use-after-free that segfaults the Julia runtime via task scheduler.
+    # Track open/closed state here so `Close` and `error_handler` can no-op
+    # the second close.
+    closed::Bool
 
     function Sender(host::String="localhost", port::Int=9009;
                     protocol::Base.Symbol=:tcps,
@@ -158,7 +164,7 @@ mutable struct Sender
 
         return new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
                    pub_key_x_utf8, pub_key_y_utf8,
-                   buffer, err, sender_ptr, auth !== nothing)
+                   buffer, err, sender_ptr, auth !== nothing, false)
     end
 end
 
@@ -242,9 +248,14 @@ function error_handler(sender::Ptr{line_sender}, buffer::Ptr{line_sender_buffer}
     if buffer != C_NULL
         line_sender_buffer_free(buffer)
     end
-    if sender != C_NULL
-        line_sender_close(sender)
-    end
+    # Intentionally do NOT call line_sender_close here. Closing belongs to
+    # the Sender lifecycle owner (typically a `finally` block in the caller,
+    # which goes through the idempotent `Close` callable). Calling close
+    # here AND in the caller's finally is a double-close: c-questdb-client
+    # 6.0.0 documents line_sender_close as non-idempotent, and under
+    # concurrent ingest the second call is a use-after-free that corrupts
+    # the Julia task scheduler and segfaults the whole runtime
+    # ("fatal: error thrown and no exception handler available").
     throw(ErrorException("$label, Message: $msg_str"))
 end
 
@@ -436,13 +447,21 @@ function(flush::Flush)()
 end
 
 """
-    Close the sender object.    
-            
+    Close the sender object.
+
+    Idempotent on the Julia side: subsequent calls after the first are
+    no-ops. The underlying c-questdb-client `line_sender_close` is documented
+    as non-idempotent — calling it twice on the same pointer is use-after-free
+    and segfaults under concurrent load. We guard with `sender.closed`.
 """
 function(close::Close)()
-    println("Closing...");
     sender = close.sender
-    line_sender_close(sender.sender);
+    if sender.closed
+        return
+    end
+    println("Closing...")
+    line_sender_close(sender.sender)
+    sender.closed = true
 end
 
 export Sender, capacity
