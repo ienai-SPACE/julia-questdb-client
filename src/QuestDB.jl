@@ -34,90 +34,160 @@ struct Close{T}
     sender::T
 end
 
-"""Sender constructor
-    Creates a sender object to send data to `host` at `port`. If `tls` is `true`, the connection
-    uses TLS encryption. If `auth` is provided, authentication will be attempted using the given
-    `auth` credentials.
-
-    ## Parameters
-    * `host`: Hostname to connect to.
-    * `port`: Port to connect to.
-    * `auth`: Authentication credentials in the form of a tuple containing `(key_id, priv_key, pub_key_x, pub_key_y)`.
-    * `tls` :  Whether to use TLS encryption. Defaults to `false`.
-    * `init_capacity`: Initial buffer capacity in bytes. Defaults to `64 * 1024`. Callers that
-      pre-size for large batches (e.g. simulation ingest) can raise this to avoid mid-flush realloc.
-
-    ## Methods
-
-    * `table(name::String)`
-    * `symbol(name::String, value::String)`
-    * `column(name::String, column_value::Union{String, Int, Float64, Bool, Dates.TimeType})`
-    * `at_now()`
-    * `at(timestamp::Dates.TimeType)`
-    * `flush()`
-
-
-    ## Returns
-    Sender object that can be used to send data.
 """
-mutable struct Sender        
+    Sender(host, port; protocol=:tcps, tls=nothing, auth=nothing, init_capacity=64*1024)
+
+Open a QuestDB ILP sender against `host`:`port` using c-questdb-client 6.x.
+
+## Parameters
+
+* `host`, `port`: target QuestDB ILP endpoint.
+* `protocol`: one of `:tcp`, `:tcps`, `:http`, `:https`. Defaults to `:tcps`
+  (TLS + ILP TCP, the production posture for IENAI).
+* `tls`: legacy boolean kwarg. If passed and `protocol` is left at default,
+  `true` is interpreted as `:tcps` and `false` as `:tcp`. Prefer `protocol`
+  in new code.
+* `auth`: `(kid, d, x, y)` tuple for ECDSA TCP auth, or `nothing`.
+* `init_capacity`: initial ILP buffer reserve in bytes.
+
+## Methods on the returned object
+
+* `table(name)` / `symbol(name, val)` / `column(name, val)` / `at(ns)` /
+  `at_now()` / `flush()` / `close()`
+
+## c-questdb-client 6.x migration notes (only relevant for maintainers)
+
+* `line_sender_opts_new` now takes `protocol` as first arg; we map our
+  Symbol → enum constant via `_resolve_protocol`.
+* TLS is no longer a separate opts toggle; it is implied by `:tcps`/`:https`.
+* Auth is no longer a single 4-arg call but 4 setters (`username`, `token`,
+  `token_x`, `token_y`), each of which can fail. We propagate failures.
+* `line_sender_connect` was renamed to `line_sender_build`.
+* TCP transport does not negotiate the wire-protocol version, so we
+  explicitly pin v1 (compatible with QuestDB <9, which IENAI's dev/staging
+  fleet still runs).
+"""
+mutable struct Sender
     host_utf8::Ref{line_sender_utf8}
     port::Ref{UInt16}
     key_id_utf8::Ref{line_sender_utf8}
     priv_key_utf8::Ref{line_sender_utf8}
     pub_key_x_utf8::Ref{line_sender_utf8}
     pub_key_y_utf8::Ref{line_sender_utf8}
-    buffer::Ref{line_sender_buffer}
-    opts::Ref{line_sender_opts}    
-    err::Ref{Ptr{line_sender_error}}    
-    sender::Ref{line_sender}
+    buffer::Ptr{line_sender_buffer}
+    err::Ref{Ptr{line_sender_error}}
+    sender::Ptr{line_sender}
     auth::Bool
-    
-    function Sender(host::String="localhost", port::Int=9009; auth=nothing, tls::Bool=false, init_capacity::Int=64 * 1024)
+
+    function Sender(host::String="localhost", port::Int=9009;
+                    protocol::Base.Symbol=:tcps,
+                    tls::Union{Bool,Nothing}=nothing,
+                    auth=nothing,
+                    init_capacity::Int=64 * 1024)
+        # Resolve effective protocol: explicit `protocol` wins; otherwise
+        # honour the legacy `tls` boolean. :tcp/:tcps flip per tls.
+        effective_protocol = if tls === nothing
+            protocol
+        elseif protocol == :tcps && tls === false
+            :tcp
+        elseif protocol == :tcp && tls === true
+            :tcps
+        else
+            protocol
+        end
+        proto_enum = _resolve_protocol(effective_protocol)
+
         err = Ref{Ptr{line_sender_error}}(C_NULL)
-        opts = Ref{line_sender_opts}()
-        sender = Ref{line_sender}()
-        port = Ref{UInt16}(port)
-        buffer = Ref{line_sender_buffer}()
-        host_utf8 = Ref{line_sender_utf8}()        
+        port_ref = Ref{UInt16}(port)
+        host_utf8 = Ref{line_sender_utf8}()
         key_id_utf8 = Ref{line_sender_utf8}()
         priv_key_utf8 = Ref{line_sender_utf8}()
         pub_key_x_utf8 = Ref{line_sender_utf8}()
         pub_key_y_utf8 = Ref{line_sender_utf8}()
 
-        is_host_ok = line_sender_utf8_init(host_utf8, length(host), host, err)    
+        # Buffer encoder version MUST match the sender's; the server-side
+        # flush enforces this. We pin both to v1 for QuestDB <9 compatibility.
+        buffer = line_sender_buffer_new(LINE_SENDER_PROTOCOL_VERSION_1)
+        line_sender_buffer_reserve(buffer, init_capacity)
 
-        global buffer = line_sender_buffer_new();
-        line_sender_buffer_reserve(buffer, init_capacity);
+        if !line_sender_utf8_init(host_utf8, length(host), host, err)
+            _abort_init(buffer, err, "host utf8 init failed")
+        end
 
-        if (is_host_ok)                                    
-            opts = line_sender_opts_new(host_utf8[], port[])                        
-          
-            if (tls)                
-                line_sender_opts_tls(opts);
-            end             
+        opts = line_sender_opts_new(proto_enum, host_utf8[], port_ref[])
+        if opts == C_NULL
+            _abort_init(buffer, err, "line_sender_opts_new returned NULL")
+        end
 
-            if (auth !== nothing)
-                println("Authenticating...")
-                line_sender_utf8_init(key_id_utf8, length(auth[1]), auth[1], err)
-                line_sender_utf8_init(priv_key_utf8, length(auth[2]), auth[2], err)
-                line_sender_utf8_init(pub_key_x_utf8, length(auth[3]), auth[3], err)
-                line_sender_utf8_init(pub_key_y_utf8, length(auth[4]), auth[4], err)        
-                line_sender_opts_auth(opts, key_id_utf8[], priv_key_utf8[], pub_key_x_utf8[], pub_key_y_utf8[])                                    
-            end        
-            
-            global sender = line_sender_connect(opts, err)                                                    
-            line_sender_opts_free(opts)        
-            
-            if (sender == C_NULL)                                
-                return error_handler(sender, buffer, err);           
-            end            
-        else            
-            error_handler(sender, buffer, err);           
-        end;
-                    
-        s = new(host_utf8, port, key_id_utf8, priv_key_utf8, pub_key_x_utf8, pub_key_y_utf8, buffer, opts, err, sender, auth !== nothing)
-        return s
+        # Pin wire-protocol v1 (QuestDB <9 compatible). v2 only matters for
+        # array types we do not ingest.
+        if !line_sender_opts_protocol_version(opts, LINE_SENDER_PROTOCOL_VERSION_1, err)
+            line_sender_opts_free(opts)
+            _abort_init(buffer, err, "protocol_version v1 setup failed")
+        end
+
+        if auth !== nothing
+            length(auth) == 4 || (line_sender_opts_free(opts); error("auth must be a 4-tuple (kid, d, x, y)"))
+            kid, d, x, y = auth
+
+            line_sender_utf8_init(key_id_utf8,   length(kid), kid, err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "kid utf8 init failed"))
+            line_sender_utf8_init(priv_key_utf8, length(d),   d,   err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "d utf8 init failed"))
+            line_sender_utf8_init(pub_key_x_utf8, length(x),  x,   err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "x utf8 init failed"))
+            line_sender_utf8_init(pub_key_y_utf8, length(y),  y,   err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "y utf8 init failed"))
+
+            line_sender_opts_username(opts, key_id_utf8[],   err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "opts_username failed"))
+            line_sender_opts_token(opts,    priv_key_utf8[], err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "opts_token failed"))
+            line_sender_opts_token_x(opts,  pub_key_x_utf8[], err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "opts_token_x failed"))
+            line_sender_opts_token_y(opts,  pub_key_y_utf8[], err) ||
+                (line_sender_opts_free(opts); _abort_init(buffer, err, "opts_token_y failed"))
+        end
+
+        # `line_sender_build` consumes opts (success or failure) — do NOT
+        # call line_sender_opts_free on the returned opts pointer afterwards.
+        sender_ptr = line_sender_build(opts, err)
+        if sender_ptr == C_NULL
+            _abort_init(buffer, err, "line_sender_build returned NULL")
+        end
+
+        return new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
+                   pub_key_x_utf8, pub_key_y_utf8,
+                   buffer, err, sender_ptr, auth !== nothing)
+    end
+end
+
+# Symbol -> c-questdb-client protocol enum.
+function _resolve_protocol(p::Base.Symbol)
+    p === :tcp   && return LINE_SENDER_PROTOCOL_TCP
+    p === :tcps  && return LINE_SENDER_PROTOCOL_TCPS
+    p === :http  && return LINE_SENDER_PROTOCOL_HTTP
+    p === :https && return LINE_SENDER_PROTOCOL_HTTPS
+    error("Unknown QuestDB protocol $(p); use one of :tcp, :tcps, :http, :https")
+end
+
+# Abort path during Sender construction: surface the C error message,
+# release the dangling buffer, and throw.
+function _abort_init(buffer, err::Ref{Ptr{line_sender_error}}, context::String)
+    if err[] != C_NULL
+        len = Ref{Csize_t}(0)
+        msg_ptr = line_sender_error_msg(err[], len)
+        msg = unsafe_string(msg_ptr, len[])
+        line_sender_error_free(err[])
+        if buffer != C_NULL
+            line_sender_buffer_free(buffer)
+        end
+        throw(ErrorException("QuestDB Sender init failed [$context]: $msg"))
+    else
+        if buffer != C_NULL
+            line_sender_buffer_free(buffer)
+        end
+        throw(ErrorException("QuestDB Sender init failed [$context]: no error detail available"))
     end
 end
 
@@ -141,36 +211,41 @@ function Base.getproperty(s::Sender, f::Base.Symbol)
     return getfield(s, f)
 end
 
-function error_handler(sender::Ref{line_sender}, buffer::Ptr{line_sender_buffer}, err::Ref{Ptr{line_sender_error}})                
-    code = line_sender_error_get_code(err[]) 
+function error_handler(sender::Ptr{line_sender}, buffer::Ptr{line_sender_buffer}, err::Ref{Ptr{line_sender_error}})
+    code = line_sender_error_get_code(err[])
     len = Ref{Csize_t}(100)
-    message = line_sender_error_msg(err[], len)    
-    println(unsafe_string(message, len[]))
-    
-    if (code == 0)        
-        error_message = "Error: Could not resolve address, Message: $(unsafe_string(message, len[]))"             
-    elseif (code == 1)
-        error_message = "Invalid API call, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 2)        
-        error_message = "Socket error, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 3)
-        error_message = "Invalid UTF8, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 4)
-        error_message = "Invalid name, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 5)
-        error_message = "Invalid timestamp, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 6)
-        error_message = "Auth eror, Message: $(unsafe_string(message, len[]))"
-    elseif (code == 7)
-        error_message = "TLS error, Message: $(unsafe_string(message, len[]))"
-    else
-        error_message = "Unknown error, Message: $(unsafe_string(message, len[]))"
-    end    
+    message = line_sender_error_msg(err[], len)
+    msg_str = unsafe_string(message, len[])
+    println(msg_str)
 
-    line_sender_error_free(err[]);    
-    line_sender_buffer_free(buffer);
-    line_sender_close(sender);
-    throw(ErrorException(error_message))        
+    label = if code == 0
+        "Could not resolve address"
+    elseif code == 1
+        "Invalid API call"
+    elseif code == 2
+        "Socket error"
+    elseif code == 3
+        "Invalid UTF8"
+    elseif code == 4
+        "Invalid name"
+    elseif code == 5
+        "Invalid timestamp"
+    elseif code == 6
+        "Auth error"
+    elseif code == 7
+        "TLS error"
+    else
+        "Unknown error (code=$code)"
+    end
+
+    line_sender_error_free(err[])
+    if buffer != C_NULL
+        line_sender_buffer_free(buffer)
+    end
+    if sender != C_NULL
+        line_sender_close(sender)
+    end
+    throw(ErrorException("$label, Message: $msg_str"))
 end
 
 function capacity(sender::Sender)
@@ -269,8 +344,8 @@ function(column::Column)(name::String, column_value::Union{String, Int64, Float6
     elseif column_value isa Bool
         line_sender_buffer_column_bool(sender.buffer, col_name, column_value, sender.err);                                                
     elseif column_value isa Microsecond
-        ts = convert(Int64, Dates.value(column_value));            
-        line_sender_buffer_column_ts(sender.buffer, col_name, ts, sender.err);                        
+        ts = convert(Int64, Dates.value(column_value));
+        line_sender_buffer_column_ts_micros(sender.buffer, col_name, ts, sender.err);
     else
         throw("Unsupported type: $(typeof(column_value))");        
     end;
@@ -304,13 +379,13 @@ end
     sender.flush()
     ```
 """
-function(at::At)(ts::Dates.Nanosecond)    
+function(at::At)(ts::Dates.Nanosecond)
     sender = at.sender
-    ts = convert(Int64, Dates.value(ts));        
-    line_sender_buffer_at(sender.buffer, ts, sender.err);       
+    ts_ns = convert(Int64, Dates.value(ts))
+    line_sender_buffer_at_nanos(sender.buffer, ts_ns, sender.err)
 
     if (sender.err[] != C_NULL)
-        return error_handler(sender.sender, sender.buffer, sender.err);           
+        return error_handler(sender.sender, sender.buffer, sender.err)
     end
     sender
 end

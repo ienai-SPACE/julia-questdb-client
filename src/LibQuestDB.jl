@@ -197,14 +197,20 @@ end
 
 mutable struct line_sender_buffer end
 
-# no prototype is found for this function at line_sender.h:235:21, please use with caution
 """
-    line_sender_buffer_new()
+    line_sender_buffer_new(version) -> Ptr{line_sender_buffer}
 
-Create a buffer for serializing ILP messages.
+Create a buffer for serializing ILP messages, pinned to `version` (a
+LINE_SENDER_PROTOCOL_VERSION_* enum). In c-questdb-client 6.0.0 the buffer
+encoder picks per-column wire format based on this version (e.g. v1 emits
+f64 as text, v2 emits binary). The sender will refuse a flush if the
+buffer's version does not match the sender's configured version.
+
+Prefer `line_sender_buffer_new_for_sender(sender)` when you already have
+a sender object — it inherits the right version automatically.
 """
-function line_sender_buffer_new()
-    ccall((:line_sender_buffer_new, libquestdb_client), Ptr{line_sender_buffer}, ())
+function line_sender_buffer_new(version)
+    ccall((:line_sender_buffer_new, libquestdb_client), Ptr{line_sender_buffer}, (Cint,), version)
 end
 
 
@@ -412,9 +418,13 @@ function line_sender_buffer_column_str(buffer, name, value, err_out)
 end
 
 """
-    line_sender_buffer_column_ts(buffer, name, micros, err_out)
+    line_sender_buffer_column_ts_micros(buffer, name, micros, err_out)
 
-Append a value for a TIMESTAMP column.
+Append a microsecond-precision TIMESTAMP column value.
+
+c-questdb-client 6.0.0 split the old `line_sender_buffer_column_ts` into
+`_micros` and `_nanos` variants; this binding keeps the existing high-level
+API (which already passes microseconds) and just retargets the symbol.
 
 ### Parameters
 * `buffer`:\\[in\\] Line buffer object.
@@ -424,16 +434,17 @@ Append a value for a TIMESTAMP column.
 ### Returns
 true on success, false on error.
 """
-function line_sender_buffer_column_ts(buffer, name, micros, err_out)
-    ccall((:line_sender_buffer_column_ts, libquestdb_client), Bool, (Ptr{line_sender_buffer}, line_sender_column_name, Int64, Ptr{Ptr{line_sender_error}}), buffer, name, micros, err_out)
+function line_sender_buffer_column_ts_micros(buffer, name, micros, err_out)
+    ccall((:line_sender_buffer_column_ts_micros, libquestdb_client), Bool, (Ptr{line_sender_buffer}, line_sender_column_name, Int64, Ptr{Ptr{line_sender_error}}), buffer, name, micros, err_out)
 end
 
 """
-    line_sender_buffer_at(buffer, epoch_nanos, err_out)
+    line_sender_buffer_at_nanos(buffer, epoch_nanos, err_out)
 
-Complete the row with a specified timestamp.
+Complete the row with a specified nanosecond timestamp.
 
-After this call, you can start batching the next row by calling `table` again, or you can send the accumulated batch by calling `flush`.
+Renamed from `line_sender_buffer_at` in c-questdb-client 6.0.0 (the old
+name now has `_nanos` / `_micros` variants).
 
 ### Parameters
 * `buffer`:\\[in\\] Line buffer object.
@@ -442,8 +453,8 @@ After this call, you can start batching the next row by calling `table` again, o
 ### Returns
 true on success, false on error.
 """
-function line_sender_buffer_at(buffer, epoch_nanos, err_out)
-    ccall((:line_sender_buffer_at, libquestdb_client), Bool, (Ptr{line_sender_buffer}, Int64, Ptr{Ptr{line_sender_error}}), buffer, epoch_nanos, err_out)
+function line_sender_buffer_at_nanos(buffer, epoch_nanos, err_out)
+    ccall((:line_sender_buffer_at_nanos, libquestdb_client), Bool, (Ptr{line_sender_buffer}, Int64, Ptr{Ptr{line_sender_error}}), buffer, epoch_nanos, err_out)
 end
 
 """
@@ -467,91 +478,111 @@ mutable struct line_sender end
 
 mutable struct line_sender_opts end
 
+# c-questdb-client 6.0.0 transport protocols.
+# Values match the enum order in include/questdb/ingress/line_sender.h.
+const LINE_SENDER_PROTOCOL_TCP   = Cint(0)
+const LINE_SENDER_PROTOCOL_TCPS  = Cint(1)
+const LINE_SENDER_PROTOCOL_HTTP  = Cint(2)
+const LINE_SENDER_PROTOCOL_HTTPS = Cint(3)
+
+# c-questdb-client 6.0.0 ILP wire-protocol versions.
+# TCP transports do NOT negotiate; default v1 (QuestDB <9 compatible).
+const LINE_SENDER_PROTOCOL_VERSION_1 = Cint(1)
+const LINE_SENDER_PROTOCOL_VERSION_2 = Cint(2)
+
 """
-    line_sender_opts_new(host, port)
+    line_sender_opts_new(protocol, host, port)
 
 A new set of options for a line sender connection.
 
+c-questdb-client 6.0.0 added the `protocol` enum as a required first
+argument (tcp/tcps/http/https); the old `(host, port)` two-arg form no
+longer exists in the .so.
+
 ### Parameters
+* `protocol`:\\[in\\] One of LINE_SENDER_PROTOCOL_TCP/TCPS/HTTP/HTTPS.
 * `host`:\\[in\\] The QuestDB database host.
 * `port`:\\[in\\] The QuestDB database port.
 """
-function line_sender_opts_new(host, port)
-    ccall((:line_sender_opts_new, libquestdb_client), Ptr{line_sender_opts}, (line_sender_utf8, UInt16), host, port)
+function line_sender_opts_new(protocol, host, port)
+    ccall((:line_sender_opts_new, libquestdb_client), Ptr{line_sender_opts}, (Cint, line_sender_utf8, UInt16), protocol, host, port)
 end
 
 """
-    line_sender_opts_xhost, port)
+    line_sender_opts_new_service(protocol, host, port)
 
-A new set of options for a line sender connection.
-
-### Parameters
-* `host`:\\[in\\] The QuestDB database host.
-* `port`:\\[in\\] The QuestDB database port as service name.
+Same as `line_sender_opts_new` but with the port specified as a service
+name (utf8). Also gained the `protocol` first arg in 6.0.0.
 """
-function line_sender_opts_new_service(host, port)    
-    ccall((:line_sender_opts_new_service, libquestdb_client), Ptr{line_sender_opts}, (line_sender_utf8, line_sender_utf8), host, port)    
+function line_sender_opts_new_service(protocol, host, port)
+    ccall((:line_sender_opts_new_service, libquestdb_client), Ptr{line_sender_opts}, (Cint, line_sender_utf8, line_sender_utf8), protocol, host, port)
+end
+
+# Removed in c-questdb-client 6.0.0 migration:
+#   line_sender_opts_net_interface  -> renamed to line_sender_opts_bind_interface
+#                                     (also: now returns Bool + err_out param).
+# We do not bind the new form because no caller in this fork uses it.
+
+"""
+    line_sender_opts_username(opts, username, err_out) -> Bool
+
+Set the username (TCP: ECDSA `kid`; HTTP: basic-auth username).
+
+In c-questdb-client 6.0.0 the old `line_sender_opts_auth` 4-tuple call was
+split into four setters with err-out params. Caller must check the Bool
+and bail on false.
+"""
+function line_sender_opts_username(opts, username, err_out)
+    ccall((:line_sender_opts_username, libquestdb_client), Bool, (Ptr{line_sender_opts}, line_sender_utf8, Ptr{Ptr{line_sender_error}}), opts, username, err_out)
 end
 
 """
-    line_sender_opts_net_interface(opts, net_interface)
+    line_sender_opts_token(opts, token, err_out) -> Bool
 
-Select local outbound interface.
+TCP: ECDSA private key `d`. HTTP: bearer token.
 """
-function line_sender_opts_net_interface(opts, net_interface)
-    ccall((:line_sender_opts_net_interface, libquestdb_client), Cvoid, (Ptr{line_sender_opts}, line_sender_utf8), opts, net_interface)
+function line_sender_opts_token(opts, token, err_out)
+    ccall((:line_sender_opts_token, libquestdb_client), Bool, (Ptr{line_sender_opts}, line_sender_utf8, Ptr{Ptr{line_sender_error}}), opts, token, err_out)
 end
 
 """
-    line_sender_opts_auth(opts, key_id, priv_key, pub_key_x, pub_key_y)
+    line_sender_opts_token_x(opts, token_x, err_out) -> Bool
 
-Authentication Parameters.
-
-### Parameters
-* `key_id`:\\[in\\] Key id. AKA "kid"
-* `priv_key`:\\[in\\] Private key. AKA "d".
-* `pub_key_x`:\\[in\\] Public key X coordinate. AKA "x".
-* `pub_key_y`:\\[in\\] Public key Y coordinate. AKA "y".
+ECDSA public key X coordinate (TCP auth only).
 """
-function line_sender_opts_auth(opts, key_id, priv_key, pub_key_x, pub_key_y)
-    ccall((:line_sender_opts_auth, libquestdb_client), Cvoid, (Ptr{line_sender_opts}, line_sender_utf8, line_sender_utf8, line_sender_utf8, line_sender_utf8), opts, key_id, priv_key, pub_key_x, pub_key_y)
+function line_sender_opts_token_x(opts, token_x, err_out)
+    ccall((:line_sender_opts_token_x, libquestdb_client), Bool, (Ptr{line_sender_opts}, line_sender_utf8, Ptr{Ptr{line_sender_error}}), opts, token_x, err_out)
 end
 
 """
-    line_sender_opts_tls(opts)
+    line_sender_opts_token_y(opts, token_y, err_out) -> Bool
 
-Enable full connection encryption via TLS. The connection will accept certificates by well-known certificate authorities as per the "webpki-roots" Rust crate.
+ECDSA public key Y coordinate (TCP auth only).
 """
-function line_sender_opts_tls(opts)
-    ccall((:line_sender_opts_tls, libquestdb_client), Cvoid, (Ptr{line_sender_opts},), opts)
+function line_sender_opts_token_y(opts, token_y, err_out)
+    ccall((:line_sender_opts_token_y, libquestdb_client), Bool, (Ptr{line_sender_opts}, line_sender_utf8, Ptr{Ptr{line_sender_error}}), opts, token_y, err_out)
 end
 
 """
-    line_sender_opts_tls_ca(opts, ca_path)
+    line_sender_opts_protocol_version(opts, version, err_out) -> Bool
 
-Enable full connection encryption via TLS. The connection will accept certificates by the specified certificate authority file.
+Pin the ILP wire-protocol version. TCP does NOT negotiate, so callers
+SHOULD explicitly set v1 (QuestDB <9 compatible) or v2 (QuestDB ≥9, supports
+arrays). Pass one of LINE_SENDER_PROTOCOL_VERSION_1 / _VERSION_2.
 """
-function line_sender_opts_tls_ca(opts, ca_path)
-    ccall((:line_sender_opts_tls_ca, libquestdb_client), Cvoid, (Ptr{line_sender_opts}, line_sender_utf8), opts, ca_path)
+function line_sender_opts_protocol_version(opts, version, err_out)
+    ccall((:line_sender_opts_protocol_version, libquestdb_client), Bool, (Ptr{line_sender_opts}, Cint, Ptr{Ptr{line_sender_error}}), opts, version, err_out)
 end
 
-"""
-    line_sender_opts_tls_insecure_skip_verify(opts)
-
-Enable TLS whilst dangerously accepting any certificate as valid. This should only be used for debugging. Consider using calling "tls\\_ca" instead.
-"""
-function line_sender_opts_tls_insecure_skip_verify(opts)
-    ccall((:line_sender_opts_tls_insecure_skip_verify, libquestdb_client), Cvoid, (Ptr{line_sender_opts},), opts)
-end
-
-"""
-    line_sender_opts_read_timeout(opts, timeout_millis)
-
-Configure how long to wait for messages from the QuestDB server during the TLS handshake and authentication process. The default is 15 seconds.
-"""
-function line_sender_opts_read_timeout(opts, timeout_millis)
-    ccall((:line_sender_opts_read_timeout, libquestdb_client), Cvoid, (Ptr{line_sender_opts}, UInt64), opts, timeout_millis)
-end
+# Removed in c-questdb-client 6.0.0 migration:
+#   line_sender_opts_tls_ca         -> symbol still exists but takes a
+#                                     `line_sender_ca` enum, NOT a utf8 path.
+#                                     Old binding would silently corrupt opts.
+#   line_sender_opts_tls_insecure_skip_verify -> replaced by
+#                                     line_sender_opts_tls_verify(opts, false, &err).
+#   line_sender_opts_read_timeout   -> renamed to line_sender_opts_auth_timeout
+#                                     (now Bool + err_out param).
+# No caller in this fork uses these; bind on demand if a use case appears.
 
 """
     line_sender_opts_clone(opts)
@@ -572,19 +603,20 @@ function line_sender_opts_free(opts)
 end
 
 """
-    line_sender_connect(opts, err_out)
+    line_sender_build(opts, err_out)
 
-Synchronously connect to the QuestDB database. The connection should be accessed by only a single thread a time.
+Build a sender from the opts (renamed from `line_sender_connect` in
+c-questdb-client 6.0.0). Returns NULL on error; `err_out` carries detail.
 
 !!! note
 
-    The opts object is freed.
+    The opts object is consumed by the call. Do not call `opts_free` on it.
 
 ### Parameters
 * `opts`:\\[in\\] Options for the connection.
 """
-function line_sender_connect(opts, err_out)        
-    ccall((:line_sender_connect, libquestdb_client), Ptr{line_sender}, (Ptr{line_sender_opts}, Ptr{Ptr{line_sender_error}}), opts, err_out)    
+function line_sender_build(opts, err_out)
+    ccall((:line_sender_build, libquestdb_client), Ptr{line_sender}, (Ptr{line_sender_opts}, Ptr{Ptr{line_sender_error}}), opts, err_out)
 end
 
 
@@ -649,7 +681,40 @@ function line_sender_close(sender)
     ccall((:line_sender_close, libquestdb_client), Cvoid, (Ptr{line_sender},), sender)
 end
 
-export line_sender_utf8, line_sender_utf8_assert, line_sender_utf8_init, line_sender_utf8_init, line_sender_table_name, line_sender_table_name_assert, line_sender_column_name, line_sender_column_name_assert, line_sender_error, line_sender_error_code, line_sender_error_get_code, line_sender_error_msg, line_sender_error_free, line_sender_utf8_init, line_sender_table_name_init, line_sender_column_name_init, line_sender_buffer_new, line_sender_buffer_with_max_name_len, line_sender_buffer_free, line_sender_buffer_clone, line_sender_buffer_reserve, line_sender_buffer_capacity, line_sender_buffer_set_marker, line_sender_buffer_rewind_to_marker, line_sender_buffer_clear_marker, line_sender_buffer_clear, line_sender_buffer_size, line_sender_buffer_peek, line_sender_buffer_table, line_sender_buffer_symbol, line_sender_buffer_column_bool, line_sender_buffer_column_i64, line_sender_buffer_column_f64, line_sender_buffer_column_str, line_sender_buffer_column_ts, line_sender_buffer_at, line_sender_buffer_at_now, line_sender, line_sender_opts, line_sender_opts_new, line_sender_opts_new_service, line_sender_opts_net_interface, line_sender_opts_auth, line_sender_opts_tls, line_sender_opts_tls_ca, line_sender_opts_tls_insecure_skip_verify, line_sender_opts_read_timeout, line_sender_opts_clone, line_sender_opts_free, line_sender_connect, line_sender_flush, line_sender_flush_and_keep, line_sender_must_close, line_sender_close, line_sender_buffer, line_sender_buffer_capacity
+export
+    # Types / structs
+    line_sender, line_sender_opts, line_sender_buffer, line_sender_error, line_sender_error_code,
+    line_sender_utf8, line_sender_utf8_assert,
+    line_sender_table_name, line_sender_table_name_assert,
+    line_sender_column_name, line_sender_column_name_assert,
+    # 6.0.0 protocol + protocol-version enum constants
+    LINE_SENDER_PROTOCOL_TCP, LINE_SENDER_PROTOCOL_TCPS,
+    LINE_SENDER_PROTOCOL_HTTP, LINE_SENDER_PROTOCOL_HTTPS,
+    LINE_SENDER_PROTOCOL_VERSION_1, LINE_SENDER_PROTOCOL_VERSION_2,
+    # utf8 / name init
+    line_sender_utf8_init, line_sender_table_name_init, line_sender_column_name_init,
+    # error
+    line_sender_error_get_code, line_sender_error_msg, line_sender_error_free,
+    # buffer lifecycle
+    line_sender_buffer_new, line_sender_buffer_with_max_name_len,
+    line_sender_buffer_free, line_sender_buffer_clone,
+    line_sender_buffer_reserve, line_sender_buffer_capacity,
+    line_sender_buffer_set_marker, line_sender_buffer_rewind_to_marker, line_sender_buffer_clear_marker,
+    line_sender_buffer_clear, line_sender_buffer_size, line_sender_buffer_peek,
+    # buffer row-building
+    line_sender_buffer_table, line_sender_buffer_symbol,
+    line_sender_buffer_column_bool, line_sender_buffer_column_i64,
+    line_sender_buffer_column_f64, line_sender_buffer_column_str,
+    line_sender_buffer_column_ts_micros, line_sender_buffer_at_nanos, line_sender_buffer_at_now,
+    # opts (6.0.0)
+    line_sender_opts_new, line_sender_opts_new_service,
+    line_sender_opts_username, line_sender_opts_token,
+    line_sender_opts_token_x, line_sender_opts_token_y,
+    line_sender_opts_protocol_version,
+    line_sender_opts_clone, line_sender_opts_free,
+    # sender lifecycle
+    line_sender_build, line_sender_flush, line_sender_flush_and_keep,
+    line_sender_must_close, line_sender_close
 
 end # module
 

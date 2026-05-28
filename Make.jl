@@ -62,9 +62,9 @@ function build()
     lib_name = lib_prefix * name * lib_suffix
     lib_path = joinpath(target_dir, lib_name)
 
-    # Copy the lib to its final destination.
-    # TODO this is pure conjecture that that's where it ought to land.
-    cp(lib_path, joinpath(@__DIR__, "src", lib_name))
+    # Copy the lib to its final destination. force=true so re-runs after a
+    # rebuild overwrite the previous .so instead of erroring out.
+    cp(lib_path, joinpath(@__DIR__, "src", lib_name); force = true)
 end
 
 
