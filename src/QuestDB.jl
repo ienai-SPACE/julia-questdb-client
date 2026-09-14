@@ -162,10 +162,40 @@ mutable struct Sender
             _abort_init(buffer, err, "line_sender_build returned NULL")
         end
 
-        return new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
-                   pub_key_x_utf8, pub_key_y_utf8,
-                   buffer, err, sender_ptr, auth !== nothing, false)
+        s = new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
+                pub_key_x_utf8, pub_key_y_utf8,
+                buffer, err, sender_ptr, auth !== nothing, false)
+
+        # Safety net for a Sender that is dropped without an explicit close.
+        # Both the connection and the ILP buffer live in the Rust allocator,
+        # which Julia's GC does not track, so nothing else ever reclaims them.
+        finalizer(s) do x
+            x.closed && return
+            _free_buffer!(x)
+            line_sender_close(x.sender)
+            x.closed = true
+        end
+
+        return s
     end
+end
+
+"""
+    _free_buffer!(s::Sender)
+
+Release the ILP buffer, exactly once.
+
+`line_sender_close` releases the connection only. The buffer is a separate
+allocation in c-questdb-client and `line_sender_buffer_free` is the only thing
+that returns it. Nulling the field keeps the call idempotent, so an error path
+followed by the caller's `finally` cannot double free.
+"""
+function _free_buffer!(s::Sender)
+    if s.buffer != C_NULL
+        line_sender_buffer_free(s.buffer)
+        s.buffer = C_NULL
+    end
+    return nothing
 end
 
 # Symbol -> c-questdb-client protocol enum.
@@ -245,9 +275,12 @@ function error_handler(sender::Ptr{line_sender}, buffer::Ptr{line_sender_buffer}
     end
 
     line_sender_error_free(err[])
-    if buffer != C_NULL
-        line_sender_buffer_free(buffer)
-    end
+    # Intentionally do NOT free the buffer here, for the same reason we do not
+    # close the sender: ownership of both belongs to the Sender lifecycle owner,
+    # which releases them through the idempotent `Close`. Freeing here as well
+    # would be a double free on every error path that the caller recovers from
+    # in a `finally`.
+    #
     # Intentionally do NOT call line_sender_close here. Closing belongs to
     # the Sender lifecycle owner (typically a `finally` block in the caller,
     # which goes through the idempotent `Close` callable). Calling close
@@ -461,6 +494,7 @@ function(close::Close)()
     end
     println("Closing...")
     line_sender_close(sender.sender)
+    _free_buffer!(sender)
     sender.closed = true
 end
 
