@@ -162,10 +162,63 @@ mutable struct Sender
             _abort_init(buffer, err, "line_sender_build returned NULL")
         end
 
-        return new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
-                   pub_key_x_utf8, pub_key_y_utf8,
-                   buffer, err, sender_ptr, auth !== nothing, false)
+        s = new(host_utf8, port_ref, key_id_utf8, priv_key_utf8,
+                pub_key_x_utf8, pub_key_y_utf8,
+                buffer, err, sender_ptr, auth !== nothing, false)
+
+        # Safety net for a Sender that is dropped without an explicit close.
+        # Both the connection and the ILP buffer live in the Rust allocator,
+        # which Julia's GC does not track, so nothing else ever reclaims them.
+        finalizer(_release!, s)
+
+        return s
     end
+end
+
+"""
+    _release!(s::Sender)
+
+Release both native resources, exactly once.
+
+`line_sender_close` frees the connection and `line_sender_buffer_free` the ILP
+buffer. They are separate allocations, the C API is non-idempotent about both,
+and before this was centralised the buffer was never freed on the happy path at
+all, so every completed Sender leaked it into the Rust allocator where Julia's
+GC cannot see it.
+
+Nulling each pointer after freeing is what makes a second call harmless, no
+matter which path arrives first: an explicit `close()`, the caller's `finally`,
+or the finalizer. `Close` and the finalizer both delegate here so the two
+teardown paths cannot drift apart.
+"""
+function _release!(s::Sender)
+    s.closed && return nothing
+    if s.sender != C_NULL
+        line_sender_close(s.sender)
+        s.sender = C_NULL
+    end
+    if s.buffer != C_NULL
+        line_sender_buffer_free(s.buffer)
+        s.buffer = C_NULL
+    end
+    s.closed = true
+    return nothing
+end
+
+"""
+    _buffer(s::Sender)
+
+The sender's ILP buffer, or a Julia error if it has already been released.
+
+Every buffer call goes through here because the C API dereferences the pointer
+without a null check: reaching it after a close would be a segfault inside Rust
+rather than an exception the caller can catch. Raising here turns a use-after-
+close from a dead runtime into an ordinary error.
+"""
+function _buffer(s::Sender)
+    (s.closed || s.buffer == C_NULL) &&
+        error("Sender is closed: its ILP buffer has been released")
+    return s.buffer
 end
 
 # Symbol -> c-questdb-client protocol enum.
@@ -245,9 +298,20 @@ function error_handler(sender::Ptr{line_sender}, buffer::Ptr{line_sender_buffer}
     end
 
     line_sender_error_free(err[])
-    if buffer != C_NULL
-        line_sender_buffer_free(buffer)
-    end
+    # Reset the slot after freeing. Every accessor tests `sender.err[] != C_NULL`
+    # to decide whether to come here, so a dangling pointer left behind would
+    # send the next call straight back into this function on memory that is
+    # already freed. That matters more now than it used to: this file no longer
+    # frees the buffer or closes the sender on an error, precisely so a caller
+    # can catch and carry on, which makes "there is a next call" the expected
+    # case rather than a mistake.
+    err[] = C_NULL
+    # Intentionally do NOT free the buffer here, for the same reason we do not
+    # close the sender: ownership of both belongs to the Sender lifecycle owner,
+    # which releases them through the idempotent `Close`. Freeing here as well
+    # would be a double free on every error path that the caller recovers from
+    # in a `finally`.
+    #
     # Intentionally do NOT call line_sender_close here. Closing belongs to
     # the Sender lifecycle owner (typically a `finally` block in the caller,
     # which goes through the idempotent `Close` callable). Calling close
@@ -260,7 +324,7 @@ function error_handler(sender::Ptr{line_sender}, buffer::Ptr{line_sender_buffer}
 end
 
 function capacity(sender::Sender)
-    return line_sender_buffer_capacity(sender.buffer)    
+    return line_sender_buffer_capacity(_buffer(sender))    
 end
 
 
@@ -282,7 +346,7 @@ end
 function(table::Table)(name::String)
     sender = table.sender
     table_name = line_sender_table_name_assert(length(name), name);                                         
-    line_sender_buffer_table(sender.buffer, table_name, sender.err);                        
+    line_sender_buffer_table(_buffer(sender), table_name, sender.err);                        
     
     if (sender.err[] != C_NULL)
         error_handler(sender.sender, sender.buffer, sender.err);           
@@ -314,7 +378,7 @@ function(symbol::Symbol)(name::String, column_value::String)
     column_pointer = Ref{line_sender_utf8}();
     
     line_sender_utf8_init(column_pointer, length(column_value), column_value, sender.err);                           
-    line_sender_buffer_symbol(sender.buffer, col_name, column_pointer[], sender.err);
+    line_sender_buffer_symbol(_buffer(sender), col_name, column_pointer[], sender.err);
 
     if (sender.err[] != C_NULL)
         return error_handler(sender.sender, sender.buffer, sender.err);           
@@ -347,16 +411,16 @@ function(column::Column)(name::String, column_value::Union{String, Int64, Float6
 
     if column_value isa String
         line_sender_utf8_init(column_pointer, length(column_value), column_value, sender.err);                           
-        line_sender_buffer_column_str(sender.buffer, col_name, column_pointer[], sender.err);
+        line_sender_buffer_column_str(_buffer(sender), col_name, column_pointer[], sender.err);
     elseif column_value isa Int64
-        line_sender_buffer_column_i64(sender.buffer, col_name, column_value, sender.err);                                        
+        line_sender_buffer_column_i64(_buffer(sender), col_name, column_value, sender.err);                                        
     elseif column_value isa Float64
-        line_sender_buffer_column_f64(sender.buffer, col_name, column_value, sender.err);                                        
+        line_sender_buffer_column_f64(_buffer(sender), col_name, column_value, sender.err);                                        
     elseif column_value isa Bool
-        line_sender_buffer_column_bool(sender.buffer, col_name, column_value, sender.err);                                                
+        line_sender_buffer_column_bool(_buffer(sender), col_name, column_value, sender.err);                                                
     elseif column_value isa Microsecond
         ts = convert(Int64, Dates.value(column_value));
-        line_sender_buffer_column_ts_micros(sender.buffer, col_name, ts, sender.err);
+        line_sender_buffer_column_ts_micros(_buffer(sender), col_name, ts, sender.err);
     else
         throw("Unsupported type: $(typeof(column_value))");        
     end;
@@ -393,7 +457,7 @@ end
 function(at::At)(ts::Dates.Nanosecond)
     sender = at.sender
     ts_ns = convert(Int64, Dates.value(ts))
-    line_sender_buffer_at_nanos(sender.buffer, ts_ns, sender.err)
+    line_sender_buffer_at_nanos(_buffer(sender), ts_ns, sender.err)
 
     if (sender.err[] != C_NULL)
         return error_handler(sender.sender, sender.buffer, sender.err)
@@ -420,7 +484,7 @@ end
 """
 function(at_now::AtNow)()    
     sender = at_now.sender
-    line_sender_buffer_at_now(sender.buffer, sender.err);       
+    line_sender_buffer_at_now(_buffer(sender), sender.err);       
 
     if (sender.err[] != C_NULL)
         return error_handler(sender.sender, sender.buffer, sender.err);           
@@ -429,18 +493,21 @@ function(at_now::AtNow)()
 end
 
 """
-    Flush the buffer of the sender object to the database.    
+    Send the buffered rows to the database and clear the buffer.
 
-    Notes
-    -----
-    * The buffer is flushed automatically when the buffer is full.
-    * The buffer is flushed automatically when the `Sender` object is garbage collected.
-    * The buffer is flushed automatically when the `Sender` object is closed.
+    Nothing flushes on your behalf. The three notes that used to sit here, that
+    a full buffer, garbage collection or a close would flush, were all wrong:
+    the buffer grows instead of flushing, `line_sender_close` is documented as
+    not flushing, and the finalizer added alongside this comment releases the
+    buffer without sending it. Rows that were never flushed are discarded.
+
+    Call this before `close()`, and on a long ingest call it periodically so
+    the buffer does not grow to hold the entire batch.
 """
 function(flush::Flush)()
     println("Flushing...");
     sender = flush.sender
-    line_sender_flush(sender.sender, sender.buffer, sender.err);    
+    line_sender_flush(sender.sender, _buffer(sender), sender.err);    
     if sender.err[] != C_NULL          
         return error_handler(sender.sender, sender.buffer, sender.err);           
     end;    
@@ -460,8 +527,7 @@ function(close::Close)()
         return
     end
     println("Closing...")
-    line_sender_close(sender.sender)
-    sender.closed = true
+    _release!(sender)
 end
 
 export Sender, capacity
